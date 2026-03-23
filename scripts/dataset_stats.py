@@ -92,9 +92,12 @@ def compute_dataset_stats(
 
                     mask_data = src.read(1)
 
-                    # Count classes
-                    for class_id in range(num_classes):
-                        class_counts[class_id] += np.sum(mask_data == class_id)
+                    # Count classes efficiently with bincount
+                    flat = mask_data.ravel()
+                    # Clip to valid range to avoid out-of-bounds
+                    flat = flat[flat < num_classes]
+                    counts = np.bincount(flat, minlength=num_classes)
+                    class_counts += counts[:num_classes]
 
             except Exception as e:
                 logger.warning(f"Error reading {mask_file.name}: {e}")

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
-from rasterio.windows import Window
+from rasterio.windows import Window, transform as window_transform
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -109,34 +109,27 @@ def tile_geotiff(
                         pbar.update(1)
                         continue
 
-                    # Check for nodata
-                    nodata_count = np.sum(
-                        (tile_data == 0) | np.isnan(tile_data)
+                    # Check for nodata using raster metadata
+                    nodata_val = src.nodata
+                    if nodata_val is not None:
+                        nodata_count = np.sum(tile_data == nodata_val)
+                    else:
+                        # Fallback: check for all-zero pixels across bands
+                        # (all bands zero at a pixel = likely nodata)
+                        nodata_count = np.sum(
+                            np.all(tile_data == 0, axis=0)
+                        )
+                    nodata_fraction = nodata_count / (
+                        tile_data.shape[1] * tile_data.shape[2]
                     )
-                    nodata_fraction = nodata_count / tile_data.size
 
                     if nodata_fraction > nodata_threshold:
                         tiles_skipped += 1
                         pbar.update(1)
                         continue
 
-                    # Prepare output profile
-                    out_transform = rasterio.transform.from_bounds(
-                        *rasterio.transform.xy(
-                            transform,
-                            col_start,
-                            row_start,
-                            offset="ul",
-                        ),
-                        *rasterio.transform.xy(
-                            transform,
-                            col_start + tile_size,
-                            row_start + tile_size,
-                            offset="ul",
-                        ),
-                        tile_size,
-                        tile_size,
-                    )
+                    # Compute geotransform for this tile window
+                    out_transform = window_transform(window, transform)
 
                     output_profile = {
                         **profile,

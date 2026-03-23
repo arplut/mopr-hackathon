@@ -80,115 +80,117 @@ def solar_potential(
             "output_path": str(gpkg_path),
         }
 
-    # Open DSM
+    # Open DSM once, keep handle open for all buildings
     logger.info(f"Reading DSM: {dsm_path}")
-    with rasterio.open(dsm_path) as dsm_src:
-        dsm_transform = dsm_src.transform
-        dsm_crs = dsm_src.crs
+    dsm_src = rasterio.open(dsm_path)
+    dsm_transform = dsm_src.transform
+    dsm_crs = dsm_src.crs
+    pixel_area = abs(dsm_transform.a * dsm_transform.e)
 
-        # Check CRS match
-        if dsm_crs != rcc_buildings.crs:
-            logger.warning(
-                f"CRS mismatch: GeoPackage uses {rcc_buildings.crs}, "
-                f"DSM uses {dsm_crs}"
-            )
+    # Check CRS match
+    if dsm_crs != rcc_buildings.crs:
+        logger.warning(
+            f"CRS mismatch: GeoPackage uses {rcc_buildings.crs}, "
+            f"DSM uses {dsm_crs}"
+        )
 
-        # Initialize solar potential column
-        rcc_buildings["solar_potential"] = "unknown"
-        rcc_buildings["unshaded_area_m2"] = 0.0
+    # Initialize solar potential columns
+    rcc_buildings["solar_potential"] = "unknown"
+    rcc_buildings["unshaded_area_m2"] = 0.0
 
-        high_count = 0
-        medium_count = 0
-        low_count = 0
+    high_count = 0
+    medium_count = 0
+    low_count = 0
 
-        # Process each RCC building
-        with tqdm(rcc_buildings.iterrows(), total=len(rcc_buildings), desc="Computing solar potential") as pbar:
-            for idx, building in pbar:
-                try:
-                    geom = building.geometry
+    # Process each RCC building
+    for idx, building in tqdm(
+        rcc_buildings.iterrows(),
+        total=len(rcc_buildings),
+        desc="Computing solar potential",
+    ):
+        try:
+            geom = building.geometry
 
-                    # Extract DSM pixels within building footprint
-                    with rasterio.open(dsm_path) as src:
-                        try:
-                            cropped, cropped_transform = rio_mask(
-                                src,
-                                [geom],
-                                crop=True,
-                            )
-                        except ValueError:
-                            # Geometry outside raster bounds
-                            rcc_buildings.at[idx, "solar_potential"] = "no_data"
-                            pbar.update(1)
-                            continue
+            # Extract DSM pixels within building footprint (reuse open handle)
+            try:
+                cropped, cropped_transform = rio_mask(
+                    dsm_src,
+                    [geom],
+                    crop=True,
+                )
+            except ValueError:
+                rcc_buildings.at[idx, "solar_potential"] = "no_data"
+                continue
 
-                    # Get elevation values
-                    dsm_values = cropped[0]
-                    valid_mask = ~np.isnan(dsm_values) & (dsm_values > 0)
+            dsm_values = cropped[0]
+            valid_mask = ~np.isnan(dsm_values) & (dsm_values > 0)
 
-                    if not valid_mask.any():
-                        rcc_buildings.at[idx, "solar_potential"] = "no_data"
-                        pbar.update(1)
-                        continue
+            if not valid_mask.any():
+                rcc_buildings.at[idx, "solar_potential"] = "no_data"
+                continue
 
-                    # Find maximum elevation in building
-                    max_elevation = np.max(dsm_values[valid_mask])
+            max_elevation = np.max(dsm_values[valid_mask])
 
-                    # Find unshaded area (within threshold of max)
-                    unshaded_mask = (
-                        np.abs(dsm_values - max_elevation) <= elevation_threshold
-                    ) & valid_mask
+            # Unshaded area: cells within threshold of max elevation
+            unshaded_mask = (
+                np.abs(dsm_values - max_elevation) <= elevation_threshold
+            ) & valid_mask
+            unshaded_area = float(np.sum(unshaded_mask) * pixel_area)
 
-                    # Calculate unshaded area
-                    pixel_area = abs(dsm_transform.a * dsm_transform.e)
-                    unshaded_area = np.sum(unshaded_mask) * pixel_area
+            if unshaded_area > high_threshold:
+                solar_class = "high"
+                high_count += 1
+            elif unshaded_area > medium_threshold:
+                solar_class = "medium"
+                medium_count += 1
+            else:
+                solar_class = "low"
+                low_count += 1
 
-                    # Classify solar potential
-                    if unshaded_area > high_threshold:
-                        solar_class = "high"
-                        high_count += 1
-                    elif unshaded_area > medium_threshold:
-                        solar_class = "medium"
-                        medium_count += 1
-                    else:
-                        solar_class = "low"
-                        low_count += 1
+            rcc_buildings.at[idx, "solar_potential"] = solar_class
+            rcc_buildings.at[idx, "unshaded_area_m2"] = unshaded_area
 
-                    rcc_buildings.at[idx, "solar_potential"] = solar_class
-                    rcc_buildings.at[idx, "unshaded_area_m2"] = float(unshaded_area)
+        except Exception as e:
+            logger.debug(f"Error processing building {idx}: {e}")
+            rcc_buildings.at[idx, "solar_potential"] = "error"
+            continue
 
-                except Exception as e:
-                    logger.debug(f"Error processing building {idx}: {e}")
-                    rcc_buildings.at[idx, "solar_potential"] = "error"
-                    pbar.update(1)
-                    continue
+    dsm_src.close()
 
-                pbar.update(0)
+    # Read ALL existing layers so we don't lose them when rewriting the GPKG
+    logger.info(f"Saving updated GeoPackage: {gpkg_path}")
+    existing_layers = {}
+    try:
+        import fiona
+        layer_names = fiona.listlayers(str(gpkg_path))
+        for layer_name in layer_names:
+            if layer_name != "buildings":
+                existing_layers[layer_name] = gpd.read_file(gpkg_path, layer=layer_name)
+    except Exception:
+        pass
 
-        # Save updated GeoPackage
-        logger.info(f"Saving updated GeoPackage: {gpkg_path}")
-        gdf_buildings.update(rcc_buildings)
-        gdf_buildings.to_file(gpkg_path, layer="buildings", driver="GPKG")
+    # Update the buildings GeoDataFrame with solar potential columns
+    gdf_buildings.update(rcc_buildings[["solar_potential", "unshaded_area_m2"]])
 
-        logger.info(f"Solar potential estimation complete")
+    # Rewrite the GPKG with all layers preserved
+    gdf_buildings.to_file(gpkg_path, layer="buildings", driver="GPKG")
+    for layer_name, layer_gdf in existing_layers.items():
+        layer_gdf.to_file(gpkg_path, layer=layer_name, driver="GPKG", mode="a")
 
-        return {
-            "num_rcc_buildings": len(rcc_buildings),
-            "high_potential": high_count,
-            "medium_potential": medium_count,
-            "low_potential": low_count,
-            "output_path": str(gpkg_path),
-            "statistics": {
-                "mean_unshaded_area": float(
-                    rcc_buildings["unshaded_area_m2"].mean()
-                ),
-                "median_unshaded_area": float(
-                    rcc_buildings["unshaded_area_m2"].median()
-                ),
-                "max_unshaded_area": float(
-                    rcc_buildings["unshaded_area_m2"].max()
-                ),
-            },
-        }
+    logger.info("Solar potential estimation complete")
+
+    return {
+        "num_rcc_buildings": len(rcc_buildings),
+        "high_potential": high_count,
+        "medium_potential": medium_count,
+        "low_potential": low_count,
+        "output_path": str(gpkg_path),
+        "statistics": {
+            "mean_unshaded_area": float(rcc_buildings["unshaded_area_m2"].mean()),
+            "median_unshaded_area": float(rcc_buildings["unshaded_area_m2"].median()),
+            "max_unshaded_area": float(rcc_buildings["unshaded_area_m2"].max()),
+        },
+    }
 
 
 def main():

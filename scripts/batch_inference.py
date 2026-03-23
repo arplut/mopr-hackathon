@@ -2,12 +2,26 @@
 """
 batch_inference.py: Run SegFormer-B2 inference on tiled orthophotos with test-time augmentation.
 
-This script loads a trained SegFormer-B2 model and runs sliding-window inference on
-village tile directories. It applies 4-rotation + horizontal flip TTA and merges tiles
-into Cloud Optimized GeoTIFFs per village.
+This script loads a trained SegFormer-B2 model and runs inference on village tile directories.
+It applies 4-rotation + horizontal flip TTA by averaging LOGITS (not argmax labels), then
+saves both argmax masks and optionally probability/confidence rasters.
 
-Expected input: 4-channel tiles (RGB + DSM)
-Output: Segmentation masks (uint8, values 0-8)
+Expected input structure:
+  tile_dir/
+    village_001/
+      village_001_0000_0000.tif   (4-channel: RGB + DSM)
+      village_001_0000_0001.tif
+      ...
+    village_002/
+      ...
+
+Output structure:
+  output_dir/
+    village_001/
+      village_001_0000_0000_pred.tif  (uint8, argmax class)
+      village_001_0000_0000_prob.tif  (float32, num_classes bands — softmax)
+      village_001_0000_0000_conf.tif  (float32, per-pixel max softmax)
+    ...
 
 Author: MoPR Hackathon Team
 """
@@ -22,7 +36,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoModelForSemanticSegmentation
+from transformers import SegformerForSemanticSegmentation
+import torch.nn as nn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,20 +45,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ImageNet normalization for RGB channels
+RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+RGB_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 class TileDataset(Dataset):
-    """Dataset for loading GeoTIFF tiles."""
+    """Dataset for loading 4-channel GeoTIFF tiles (RGB + DSM)."""
 
-    def __init__(self, tile_paths: list, patch_size: int = 512):
-        """
-        Initialize TileDataset.
-
-        Args:
-            tile_paths: List of paths to tile GeoTIFF files
-            patch_size: Expected patch size (default 512)
-        """
+    def __init__(self, tile_paths: list):
         self.tile_paths = tile_paths
-        self.patch_size = patch_size
 
     def __len__(self):
         return len(self.tile_paths)
@@ -52,87 +63,101 @@ class TileDataset(Dataset):
         tile_path = self.tile_paths[idx]
 
         with rasterio.open(tile_path) as src:
-            # Read 4 channels: RGB + DSM
-            if src.count >= 4:
-                data = src.read([1, 2, 3, 4])  # RGB + DSM
+            num_bands = src.count
+
+            if num_bands >= 4:
+                data = src.read([1, 2, 3, 4]).astype(np.float32)  # (4, H, W)
+            elif num_bands == 3:
+                rgb = src.read([1, 2, 3]).astype(np.float32)
+                dsm_zeros = np.zeros((1, rgb.shape[1], rgb.shape[2]), dtype=np.float32)
+                data = np.concatenate([rgb, dsm_zeros], axis=0)
+                logger.debug(f"Tile {tile_path.name} has 3 bands, padding DSM with zeros")
             else:
-                logger.warning(
-                    f"Tile {tile_path} has {src.count} bands, expected 4. Padding with zeros."
-                )
-                data = src.read()
-                # Pad to 4 channels if needed
-                if data.shape[0] < 4:
-                    padding = np.zeros(
-                        (4 - data.shape[0], data.shape[1], data.shape[2]),
-                        dtype=data.dtype,
-                    )
-                    data = np.vstack([data, padding])
+                raise ValueError(f"Tile {tile_path.name} has {num_bands} bands, expected >= 3")
 
-            # Normalize to [0, 1]
-            data = data.astype(np.float32) / 255.0
+            # Normalize RGB channels (0-255 -> ImageNet normalized)
+            for c in range(3):
+                data[c] = (data[c] / 255.0 - RGB_MEAN[c]) / RGB_STD[c]
 
-            # Get metadata
-            crs = src.crs
-            transform = src.transform
+            # Normalize DSM separately: per-tile z-score
+            dsm = data[3]
+            dsm_valid = dsm[dsm != 0]  # Exclude nodata (0)
+            if len(dsm_valid) > 0:
+                dsm_mean = dsm_valid.mean()
+                dsm_std = dsm_valid.std()
+                if dsm_std > 1e-6:
+                    data[3] = (dsm - dsm_mean) / dsm_std
+                else:
+                    data[3] = dsm - dsm_mean
+            # else: leave DSM as zeros
 
-        # Convert to tensor
-        tensor = torch.from_numpy(data)
+            # Store metadata as serializable types (not rasterio objects)
+            crs_str = str(src.crs) if src.crs else ""
+            transform_list = list(src.transform)[:6]  # affine coefficients
 
         return {
-            "image": tensor,
+            "image": torch.from_numpy(data),
             "path": str(tile_path),
-            "crs": crs,
-            "transform": transform,
+            "crs_str": crs_str,
+            "transform_coeffs": torch.tensor(transform_list, dtype=torch.float64),
         }
 
 
-def apply_tta(model, image_tensor: torch.Tensor, device: str = "cuda") -> torch.Tensor:
+def _reconstruct_transform(coeffs):
+    """Reconstruct rasterio Affine from 6 coefficients."""
+    from rasterio.transform import Affine
+    return Affine(*coeffs.tolist())
+
+
+def apply_tta_logits(
+    model,
+    image_batch: torch.Tensor,
+    device: str,
+    num_classes: int = 9,
+) -> torch.Tensor:
     """
-    Apply test-time augmentation: 4 rotations × 2 flips.
+    Apply test-time augmentation by averaging LOGITS across augmentations.
 
-    Args:
-        model: Segmentation model
-        image_tensor: Input tensor [B, C, H, W]
-        device: Device to run on
-
-    Returns:
-        Averaged prediction tensor
+    Augmentations: original + 3 rotations (90/180/270) + horizontal flip = 5 views.
+    Returns averaged logits of shape (B, num_classes, H, W).
     """
-    augmented_preds = []
+    augmentations = [
+        (lambda x: x, lambda x: x),                                          # original
+        (lambda x: torch.rot90(x, 1, [2, 3]), lambda x: torch.rot90(x, -1, [2, 3])),  # 90°
+        (lambda x: torch.rot90(x, 2, [2, 3]), lambda x: torch.rot90(x, -2, [2, 3])),  # 180°
+        (lambda x: torch.rot90(x, 3, [2, 3]), lambda x: torch.rot90(x, -3, [2, 3])),  # 270°
+        (lambda x: torch.flip(x, [3]),         lambda x: torch.flip(x, [3])),          # h-flip
+    ]
 
-    # Original
-    augmented_preds.append(_infer_and_aggregate(model, image_tensor, device))
+    accumulated_logits = None
 
-    # 90° rotation
-    rotated_90 = torch.rot90(image_tensor, k=1, dims=(2, 3))
-    augmented_preds.append(torch.rot90(_infer_and_aggregate(model, rotated_90, device), k=-1, dims=(2, 3)))
+    for forward_aug, inverse_aug in augmentations:
+        augmented_input = forward_aug(image_batch)
 
-    # 180° rotation
-    rotated_180 = torch.rot90(image_tensor, k=2, dims=(2, 3))
-    augmented_preds.append(torch.rot90(_infer_and_aggregate(model, rotated_180, device), k=-2, dims=(2, 3)))
+        with torch.no_grad():
+            outputs = model(augmented_input.to(device))
+            logits = outputs.logits  # (B, C, H', W') — SegFormer may output smaller
 
-    # 270° rotation
-    rotated_270 = torch.rot90(image_tensor, k=3, dims=(2, 3))
-    augmented_preds.append(torch.rot90(_infer_and_aggregate(model, rotated_270, device), k=-3, dims=(2, 3)))
+            # Upsample logits to input resolution if needed
+            if logits.shape[2:] != image_batch.shape[2:]:
+                logits = F.interpolate(
+                    logits,
+                    size=image_batch.shape[2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-    # Horizontal flip
-    flipped = torch.flip(image_tensor, dims=(3,))
-    augmented_preds.append(torch.flip(_infer_and_aggregate(model, flipped, device), dims=(3,)))
+        # Reverse the augmentation on the logits
+        reversed_logits = inverse_aug(logits.cpu())
 
-    # Stack and average
-    stacked = torch.stack(augmented_preds, dim=0)
-    averaged = torch.mean(stacked, dim=0)
+        if accumulated_logits is None:
+            accumulated_logits = reversed_logits
+        else:
+            accumulated_logits += reversed_logits
 
-    return averaged
-
-
-def _infer_and_aggregate(model, image_tensor: torch.Tensor, device: str) -> torch.Tensor:
-    """Run inference and return argmax predictions."""
-    with torch.no_grad():
-        logits = model(image_tensor.unsqueeze(0).to(device)).logits
-        # logits shape: [1, num_classes, H, W]
-        preds = torch.argmax(logits, dim=1)  # [1, H, W]
-    return preds.squeeze(0).cpu()
+    # Average
+    averaged_logits = accumulated_logits / len(augmentations)
+    return averaged_logits
 
 
 def batch_inference(
@@ -142,23 +167,24 @@ def batch_inference(
     device: str = "cuda",
     batch_size: int = 4,
     use_tta: bool = True,
+    save_probabilities: bool = True,
+    num_classes: int = 9,
 ) -> dict:
     """
     Run batch inference on village tile directories.
 
     Args:
-        checkpoint_path: Path to model checkpoint (.pth)
+        checkpoint_path: Path to model checkpoint (.pt or .pth)
         tile_dir: Directory containing village subdirectories with tiles
         output_dir: Output directory for predictions
         device: Device to run on (default cuda)
         batch_size: Batch size for inference (default 4)
         use_tta: Enable test-time augmentation (default True)
+        save_probabilities: Save probability and confidence rasters (default True)
+        num_classes: Number of segmentation classes (default 9)
 
     Returns:
         Dictionary with inference statistics
-
-    Raises:
-        FileNotFoundError: If checkpoint or tile_dir not found
     """
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
@@ -173,130 +199,126 @@ def batch_inference(
 
     # Load model
     logger.info(f"Loading model from {checkpoint_path}")
-    try:
-        # Load SegFormer-B2 from HuggingFace
-        model = AutoModelForSemanticSegmentation.from_pretrained(
-            "nvidia/mit-b2",
-            num_labels=9,
-        )
-        # Load checkpoint weights
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise
+    model = SegformerForSemanticSegmentation.from_pretrained(
+        "nvidia/mit-b2",
+        num_labels=num_classes,
+        ignore_mismatched_sizes=True,
+    )
+
+    # Adapt first conv layer for 4 channels (RGB + DSM)
+    _adapt_model_to_4ch(model)
+
+    # Load checkpoint weights
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
 
     model = model.to(device)
     model.eval()
-    logger.info(f"Model loaded successfully on {device}")
+    logger.info(f"Model loaded on {device}, TTA={'on' if use_tta else 'off'}")
 
-    # Find village directories
+    # Find village directories (or flat tile directory)
     village_dirs = sorted([d for d in tile_dir.iterdir() if d.is_dir()])
     if not village_dirs:
-        raise FileNotFoundError(f"No village subdirectories found in {tile_dir}")
+        # Flat directory of tiles — treat as single village
+        village_dirs = [tile_dir]
 
-    logger.info(f"Found {len(village_dirs)} villages")
+    logger.info(f"Found {len(village_dirs)} village(s)")
 
     total_tiles = 0
     total_predictions = 0
 
-    # Process each village
-    with tqdm(village_dirs, desc="Processing villages", unit="village") as village_pbar:
-        for village_dir in village_dirs:
-            village_id = village_dir.name
+    for village_dir in tqdm(village_dirs, desc="Villages", unit="village"):
+        village_id = village_dir.name
+        tile_paths = sorted(village_dir.glob("*.tif"))
 
-            # Find tiles in this village
-            tile_paths = sorted(village_dir.glob("*.tif"))
-            if not tile_paths:
-                logger.warning(f"No tiles found in {village_id}")
-                village_pbar.update(1)
-                continue
+        # Exclude any existing prediction files
+        tile_paths = [p for p in tile_paths if "_pred" not in p.stem and "_prob" not in p.stem and "_conf" not in p.stem]
 
-            logger.info(f"Processing {village_id}: {len(tile_paths)} tiles")
-            total_tiles += len(tile_paths)
+        if not tile_paths:
+            logger.warning(f"No input tiles in {village_id}")
+            continue
 
-            # Create output directory for village
-            village_output_dir = output_dir / village_id
-            village_output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Processing {village_id}: {len(tile_paths)} tiles")
+        total_tiles += len(tile_paths)
 
-            # Create dataset and dataloader
-            dataset = TileDataset(tile_paths)
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        village_output_dir = output_dir / village_id
+        village_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run inference
-            with tqdm(
-                dataloader,
-                desc=f"Inferring {village_id}",
-                unit="batch",
-                leave=False,
-            ) as batch_pbar:
-                for batch in batch_pbar:
-                    images = batch["image"].to(device)
-                    paths = batch["path"]
-                    crs_list = batch["crs"]
-                    transform_list = batch["transform"]
+        dataset = TileDataset(tile_paths)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,  # Avoid multiprocessing issues with rasterio
+            pin_memory=True if device == "cuda" else False,
+        )
 
-                    with torch.no_grad():
-                        # Apply TTA if enabled
-                        if use_tta:
-                            predictions = []
-                            for i in range(len(images)):
-                                img = images[i : i + 1]
-                                aug_pred = apply_tta(model, img, device)
-                                predictions.append(aug_pred.numpy())
-                            predictions = np.array(predictions)
-                        else:
-                            # Standard inference
-                            logits = model(images).logits
-                            predictions = (
-                                torch.argmax(logits, dim=1).cpu().numpy()
-                            )
+        for batch in tqdm(dataloader, desc=f"  {village_id}", leave=False, unit="batch"):
+            images = batch["image"]  # (B, 4, H, W)
+            paths = batch["path"]
+            crs_strs = batch["crs_str"]
+            transform_coeffs = batch["transform_coeffs"]  # (B, 6)
 
-                    # Save predictions
-                    for i in range(len(predictions)):
-                        tile_path = Path(paths[i])
-                        pred_mask = predictions[i].astype(np.uint8)
-                        crs = crs_list[i]
-                        transform = transform_list[i]
-
-                        # Create output filename
-                        output_filename = (
-                            village_output_dir / f"{tile_path.stem}_pred.tif"
+            if use_tta:
+                logits = apply_tta_logits(model, images, device, num_classes)
+            else:
+                with torch.no_grad():
+                    outputs = model(images.to(device))
+                    logits = outputs.logits.cpu()
+                    if logits.shape[2:] != images.shape[2:]:
+                        logits = F.interpolate(
+                            logits,
+                            size=images.shape[2:],
+                            mode="bilinear",
+                            align_corners=False,
                         )
 
-                        # Save as GeoTIFF
-                        profile = {
-                            "driver": "GTiff",
-                            "height": pred_mask.shape[0],
-                            "width": pred_mask.shape[1],
-                            "count": 1,
-                            "dtype": np.uint8,
-                            "crs": crs,
-                            "transform": transform,
-                        }
+            # Convert logits to predictions
+            probs = torch.softmax(logits, dim=1)          # (B, C, H, W)
+            pred_classes = probs.argmax(dim=1).numpy().astype(np.uint8)  # (B, H, W)
+            confidence = probs.max(dim=1).values.numpy().astype(np.float32)  # (B, H, W)
+            probs_np = probs.numpy().astype(np.float32)   # (B, C, H, W)
 
-                        with rasterio.open(output_filename, "w", **profile) as dst:
-                            dst.write(pred_mask, 1)
+            for i in range(len(paths)):
+                tile_path = Path(paths[i])
+                tile_stem = tile_path.stem
+                crs_str = crs_strs[i]
+                t_coeffs = transform_coeffs[i]
+                tile_transform = _reconstruct_transform(t_coeffs)
 
-                        total_predictions += 1
+                h, w = pred_classes[i].shape
 
-                    batch_pbar.update(1)
+                base_profile = {
+                    "driver": "GTiff",
+                    "height": h,
+                    "width": w,
+                    "crs": crs_str if crs_str else None,
+                    "transform": tile_transform,
+                }
 
-            # Try to merge tiles for this village
-            try:
-                from merge_tiles_to_cog import merge_tiles_to_cog
+                # Save argmax prediction
+                pred_path = village_output_dir / f"{tile_stem}_pred.tif"
+                with rasterio.open(pred_path, "w", **{**base_profile, "count": 1, "dtype": "uint8"}) as dst:
+                    dst.write(pred_classes[i], 1)
 
-                merged_output = village_output_dir / f"{village_id}_segmentation.tif"
-                merge_tiles_to_cog(str(village_output_dir), str(merged_output))
-            except Exception as e:
-                logger.warning(f"Could not merge tiles for {village_id}: {e}")
+                if save_probabilities:
+                    # Save full probability raster (for overlap merging)
+                    prob_path = village_output_dir / f"{tile_stem}_prob.tif"
+                    with rasterio.open(prob_path, "w", **{**base_profile, "count": num_classes, "dtype": "float32"}) as dst:
+                        for c in range(num_classes):
+                            dst.write(probs_np[i, c], c + 1)
 
-            village_pbar.update(1)
+                    # Save confidence raster (for GPKG attribute)
+                    conf_path = village_output_dir / f"{tile_stem}_conf.tif"
+                    with rasterio.open(conf_path, "w", **{**base_profile, "count": 1, "dtype": "float32"}) as dst:
+                        dst.write(confidence[i], 1)
 
-    logger.info(f"Inference complete")
+                total_predictions += 1
+
+    logger.info("Inference complete")
 
     return {
         "num_villages": len(village_dirs),
@@ -304,7 +326,38 @@ def batch_inference(
         "total_predictions_saved": total_predictions,
         "output_dir": str(output_dir),
         "device": device,
+        "tta_enabled": use_tta,
+        "probabilities_saved": save_probabilities,
     }
+
+
+def _adapt_model_to_4ch(model):
+    """Modify SegFormer first conv layer to accept 4 input channels."""
+    original_conv = model.segformer.encoder.patch_embeddings[0].proj
+    original_weight = original_conv.weight.data  # (out_ch, 3, kH, kW)
+
+    new_conv = nn.Conv2d(
+        4, original_weight.shape[0],
+        kernel_size=original_conv.kernel_size,
+        stride=original_conv.stride,
+        padding=original_conv.padding,
+        bias=original_conv.bias is not None,
+    )
+
+    # Initialize: copy RGB weights, init DSM channel as mean of RGB
+    new_weight = torch.zeros(
+        original_weight.shape[0], 4,
+        original_weight.shape[2], original_weight.shape[3],
+        dtype=original_weight.dtype, device=original_weight.device,
+    )
+    new_weight[:, :3, :, :] = original_weight
+    new_weight[:, 3:, :, :] = original_weight.mean(dim=1, keepdim=True)
+
+    new_conv.weight = nn.Parameter(new_weight)
+    if original_conv.bias is not None:
+        new_conv.bias = original_conv.bias
+
+    model.segformer.encoder.patch_embeddings[0].proj = new_conv
 
 
 def main():
@@ -313,48 +366,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python batch_inference.py --checkpoint model_best.pth --tile_dir tiles/ --output_dir outputs/
-  python batch_inference.py --checkpoint model.pth --tile_dir tiles/ --output_dir preds/ \\
-    --device cuda --batch_size 8 --use_tta
+  python batch_inference.py --checkpoint best_model.pt --tile_dir tiles/ --output_dir preds/
+  python batch_inference.py --checkpoint model.pt --tile_dir tiles/ --output_dir preds/ --no_tta
         """,
     )
 
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to model checkpoint (.pth)",
-    )
-    parser.add_argument(
-        "--tile_dir",
-        type=str,
-        required=True,
-        help="Directory containing village subdirectories with tiles",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Output directory for predictions",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to run on (default: cuda)",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=4,
-        help="Batch size for inference (default: 4)",
-    )
-    parser.add_argument(
-        "--use_tta",
-        action="store_true",
-        default=True,
-        help="Enable test-time augmentation (default: enabled)",
-    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--tile_dir", type=str, required=True, help="Directory with village tile subdirs")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for predictions")
+    parser.add_argument("--device", type=str, default="cuda", help="Device (default: cuda)")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size (default: 4)")
+    parser.add_argument("--no_tta", action="store_true", help="Disable test-time augmentation")
+    parser.add_argument("--no_probabilities", action="store_true", help="Don't save probability rasters")
+    parser.add_argument("--num_classes", type=int, default=9, help="Number of classes (default: 9)")
 
     args = parser.parse_args()
 
@@ -365,7 +389,9 @@ Examples:
             output_dir=args.output_dir,
             device=args.device,
             batch_size=args.batch_size,
-            use_tta=args.use_tta,
+            use_tta=not args.no_tta,
+            save_probabilities=not args.no_probabilities,
+            num_classes=args.num_classes,
         )
 
         print(f"\n{'='*70}")
@@ -374,8 +400,9 @@ Examples:
         print(f"Villages processed:      {result['num_villages']}")
         print(f"Total tiles processed:   {result['total_tiles_processed']}")
         print(f"Total predictions saved: {result['total_predictions_saved']}")
+        print(f"TTA enabled:             {result['tta_enabled']}")
+        print(f"Probabilities saved:     {result['probabilities_saved']}")
         print(f"Output directory:        {result['output_dir']}")
-        print(f"Device:                  {result['device']}")
         print(f"{'='*70}\n")
 
     except FileNotFoundError as e:
