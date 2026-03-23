@@ -1,0 +1,121 @@
+# ============================================================================
+# MoPR Geospatial Intelligence Hackathon - Python Dependencies
+# ============================================================================
+# All versions pinned for reproducibility on Google Colab (CUDA 12.x, A100)
+# Install order: System dependencies first (apt-get in Colab), then Python packages
+
+# ============================================================================
+# MACHINE LEARNING & DEEP LEARNING
+# ============================================================================
+torch==2.0.1
+torchvision==0.15.2
+torch-lightning==2.0.8
+
+# Transformers and vision models
+transformers==4.36.2
+timm==0.9.10  # PyTorch Image Models (for SegFormer backbone)
+accelerate==0.25.0
+
+# Loss functions and optimization utilities
+torch-optim-lookahead==0.0.1
+focal-loss==0.1.0
+
+# ============================================================================
+# GEOSPATIAL & RASTER PROCESSING
+# ============================================================================
+# Note: GDAL must be installed via system package first:
+# apt-get install -y gdal-bin libgdal-dev
+# Then set: export CPLUS_INCLUDE_PATH=/usr/include/gdal && export C_INCLUDE_PATH=/usr/include/gdal
+GDAL==3.7.0
+
+rasterio==1.3.9
+rio-cogeo==5.1.0  # Cloud Optimized GeoTIFF creation
+
+# Vector data and spatial operations
+geopandas==0.14.0
+shapely==2.0.1
+fiona==1.9.5
+pyproj==3.6.1
+
+# Raster algebra
+rioxarray==0.14.0
+
+# ============================================================================
+# DATA PROCESSING & UTILITIES
+# ============================================================================
+numpy==1.24.3
+scipy==1.11.3
+scikit-learn==1.3.2
+scikit-image==0.22.0
+pandas==2.1.1
+opencv-python-headless==4.8.1.78
+
+# ============================================================================
+# DATA AUGMENTATION
+# ============================================================================
+albumentations==1.3.1  # Image augmentation (geometric + photometric)
+
+# ============================================================================
+# EXPERIMENT TRACKING & LOGGING
+# ============================================================================
+wandb==0.16.1  # Weights & Biases for reproducible ML
+tensorboard==2.15.1
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+matplotlib==3.8.2
+seaborn==0.13.0
+pillow==10.1.0
+folium==0.14.0  # Interactive map visualization
+
+# ============================================================================
+# UTILITIES & PROGRESS TRACKING
+# ============================================================================
+tqdm==4.66.1
+python-dotenv==1.0.0
+pyyaml==6.0.1
+pydantic==2.5.0
+
+# ============================================================================
+# TrainingDML-AI (for model cards and metadata packaging)
+# ============================================================================
+# Install from GitHub (not available on PyPI)
+# git+https://github.com/openrsgis/pytdml.git@main#egg=pytdml
+
+# Note: pytdml requires additional installation steps:
+# pip install git+https://github.com/openrsgis/pytdml.git
+
+# ============================================================================
+# OPTIONAL: Jupyter & Notebooks (for Colab development)
+# ============================================================================
+jupyter==1.0.0
+notebook==7.0.6
+ipywidgets==8.1.1
+
+# ============================================================================
+# DEVELOPMENT & TESTING
+# ============================================================================
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.11.0
+flake8==6.1.0
+
+# ============================================================================
+# NOTES FOR COLAB USERS
+# ============================================================================
+# 1. Before running pip install -r requirements.txt, execute:
+#    apt-get update && apt-get install -y gdal-bin libgdal-dev
+#    export CPLUS_INCLUDE_PATH=/usr/include/gdal
+#    export C_INCLUDE_PATH=/usr/include/gdal
+#
+# 2. GDAL installation can be finicky; if it fails, try:
+#    pip install GDAL==$(gdal-config --version)
+#
+# 3. After main requirements, install pytdml:
+#    pip install git+https://github.com/openrsgis/pytdml.git
+#
+# 4. Verify installation:
+#    python -c "import torch; from transformers import AutoModel; import rasterio"
+#
+# ============================================================================

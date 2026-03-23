@@ -1,0 +1,196 @@
+# ============================================================================
+# PYTHON
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================================================
+# VIRTUAL ENVIRONMENTS
+# ============================================================================
+.venv
+venv/
+ENV/
+env/
+.env
+.venv.local
+.env.local
+.env.*.local
+
+# ============================================================================
+# IDE & EDITOR
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+*.iml
+
+# ============================================================================
+# JUPYTER NOTEBOOKS
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+.jupyter/
+
+# ============================================================================
+# LARGE DATA FILES (GeoTIFFs, Models, etc.)
+# ============================================================================
+# Raw data (not committed; instructions in docs/)
+*.tif
+*.tiff
+*.TIF
+*.TIFF
+*.geotiff
+*.grb
+*.hdf
+*.h5
+
+# Model weights (too large for GitHub; stored separately)
+*.pth
+*.pt
+*.onnx
+*.h5
+*.pkl
+*.pickle
+
+# Vector data (optional; can grow large)
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# ============================================================================
+# WEIGHTS & BIASES
+# ============================================================================
+wandb/
+wandb_local/
+*.wandb
+sweep_*.yaml
+
+# ============================================================================
+# COLAB & NOTEBOOK ARTIFACTS
+# ============================================================================
+.colab_outputs/
+colab_output/
+*.ipynb_checkpoints/
+*.nb.html
+
+# ============================================================================
+# OUTPUT & TEMPORARY FILES
+# ============================================================================
+outputs/*
+!outputs/sample/
+!outputs/sample/.gitkeep
+!outputs/models/
+!outputs/models/.gitkeep
+
+tiles/
+temp/
+tmp/
+*.tmp
+*.temp
+.cache/
+
+# Segmentation intermediates
+*_raw.tif
+*_blended.tif
+*_tiles/
+
+# ============================================================================
+# LOGS & MONITORING
+# ============================================================================
+logs/
+*.log
+*.log.*
+lightning_logs/
+runs/
+
+# ============================================================================
+# TESTING
+# ============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+.hypothesis/
+
+# ============================================================================
+# SECRETS & CREDENTIALS
+# ============================================================================
+.credentials
+*.key
+*.pem
+*.ppk
+secrets.json
+api_keys.json
+~/.aws/
+~/.gcloud/
+.ssh/
+
+# ============================================================================
+# OS FILES
+# ============================================================================
+.DS_Store
+Thumbs.db
+*.lnk
+Desktop.ini
+
+# ============================================================================
+# BUILD & DIST
+# ============================================================================
+build/
+dist/
+*.egg-info/
+
+# ============================================================================
+# DOCKER (if used)
+# ============================================================================
+.dockerignore
+docker-compose.override.yml
+
+# ============================================================================
+# DATA DIRECTORY EXCEPTIONS
+# ============================================================================
+data/
+!data/.gitkeep
+!data/sample_village/
+
+# Except we do NOT commit large GeoTIFFs
+data/**/*.tif
+data/**/*.tiff
+data/**/*.gpkg
