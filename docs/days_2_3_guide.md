@@ -6,6 +6,30 @@
 
 ---
 
+## Cell 1 — Run this first in every session
+
+Before anything else, mount Drive and add the scripts folder to Python's path. Every `from X import Y` in the rest of this notebook depends on this cell having run.
+
+```python
+# Mount Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Add scripts folder to path once — all subsequent imports will work
+import sys
+SCRIPTS = '/content/drive/MyDrive/mopr-hackathon/scripts'
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
+
+# Convenience base paths
+DATA  = '/content/drive/MyDrive/mopr-hackathon'
+REPO  = '/content/drive/MyDrive/mopr-hackathon'
+```
+
+> **Why not `importlib` for everything?** `importlib` is only needed when you don't know the path at import time or are debugging a path issue. Once Drive is mounted and `sys.path` is set correctly here, normal `from X import Y` works fine for the rest of the notebook and is much more readable.
+
+---
+
 ## Pre-flight checklist (before touching GPU)
 
 These steps run on CPU and should be done first to avoid wasting GPU hours.
@@ -36,22 +60,111 @@ drive/MyDrive/mopr-hackathon/
 On Colab (CPU runtime is fine for this), run:
 
 ```python
-!pip install rasterio geopandas --quiet
+!pip install rasterio tqdm --quiet
 
-import sys
-sys.path.insert(0, '/content/drive/MyDrive/mopr-hackathon/scripts')
-from check_crs import check_crs_consistency
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    "check_crs",
+    '/content/drive/MyDrive/mopr-hackathon/scripts/check_crs.py'
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-check_crs_consistency('/content/drive/MyDrive/mopr-hackathon/raw')
+result = module.check_crs_consistency(
+    data_dir='/content/drive/MyDrive/mopr-hackathon/raw',
+    output_path='/content/crs_report.csv',
+)
 ```
 
-If any villages have mismatched CRS, reproject them with:
+> **Note:** Use `importlib` rather than `sys.path.insert` + `from ... import`. The latter
+> fails silently if Drive hasn't fully synced the folder, giving a misleading
+> `ModuleNotFoundError`. `importlib` loads from an explicit file path and always shows
+> the real error.
+
+#### Known CRS situation for this dataset
+
+Running the check on the current data reveals **4 different CRS** across the 20 files:
+
+| CRS | EPSG | Files affected |
+|---|---|---|
+| UTM Zone 43N | EPSG:32643 | Set 2 Punjab orthos (standard, keep as-is) |
+| UTM Zone 44N | EPSG:32644 | Set 1 Chhattisgarh orthos (standard, keep as-is) |
+| Web Mercator | EPSG:3857 | `fattu_bhila_37458`, `bagga_37774` (Punjab files with `_3857` suffix) |
+| Geographic WGS84 | EPSG:4326 | `gudbheli_445483`, `chanabhata_445476` (Chhattisgarh inference), `diwana_40082` (Punjab inference) |
+
+There is also **one corrupted TIF and one unavailable village**:
+- `KUTRU_451189_AAKLANKA_451163_ORTHO.tif` fails with `TIFFReadDirectory: Failed to read directory at offset 4937974012` — the file is truncated. A companion ECW exists but **ECW is not supported in Colab's GDAL build** (confirmed: `gdalinfo --formats | grep ECW` returns nothing, and `!apt-get install gdal-bin` does not add ECW support). This village must be **skipped entirely**. You have 9 usable training villages remaining, which is sufficient.
+
+#### What needs fixing before tiling
+
+EPSG:3857 (Web Mercator) and EPSG:4326 (geographic degrees) are not suitable for pixel-level work — distances and areas are distorted. Reproject those files to the correct UTM zone for their region before tiling.
+
+**Fix EPSG:3857 Punjab files → EPSG:32643:**
+
+```python
+import subprocess, glob
+
+files_3857 = [
+    '/content/drive/MyDrive/mopr-hackathon/raw/training/set2_punjab/fattu_bhila_37458/37458_fattu_bhila_ortho_3857.tif',
+    '/content/drive/MyDrive/mopr-hackathon/raw/training/set2_punjab/bagga_37774/37774_bagga_ortho_3857.tif',
+]
+
+for src in files_3857:
+    dst = src.replace('_3857.tif', '_utm43n.tif')
+    subprocess.run([
+        'gdalwarp', '-t_srs', 'EPSG:32643',
+        '-r', 'bilinear', '-co', 'COMPRESS=DEFLATE',
+        src, dst
+    ], check=True)
+    print(f"Reprojected: {dst}")
+```
+
+**Fix EPSG:4326 inference files — three known files:**
+
+All three are inference-only villages (no annotations affected):
 
 ```bash
-gdalwarp -t_srs EPSG:32643 input.tif output_reprojected.tif
+# GUDBHELI — Chhattisgarh → UTM 44N
+!gdalwarp -t_srs EPSG:32644 -r bilinear -co COMPRESS=DEFLATE \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set2_chhattisgarh/gudbheli_445483/GUDBHELI_445483_Ortho.tif" \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set2_chhattisgarh/gudbheli_445483/GUDBHELI_445483_Ortho_utm44n.tif"
+
+# CHANABHATA — Chhattisgarh → UTM 44N
+!gdalwarp -t_srs EPSG:32644 -r bilinear -co COMPRESS=DEFLATE \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set2_chhattisgarh/chanabhata_445476/CHANABHATA_445476_Ortho.tif" \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set2_chhattisgarh/chanabhata_445476/CHANABHATA_445476_Ortho_utm44n.tif"
+
+# DIWANA — Punjab → UTM 43N
+!gdalwarp -t_srs EPSG:32643 -r bilinear -co COMPRESS=DEFLATE \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set1_punjab/diwana_40082/DIWANA_BARNALA_40082_ORTHO.tif" \
+  "/content/drive/MyDrive/mopr-hackathon/raw/inference/set1_punjab/diwana_40082/DIWANA_BARNALA_40082_ORTHO_utm43n.tif"
 ```
 
-Pick the most common CRS as the target (likely UTM 43N for most of India).
+Use the `_utm44n.tif` / `_utm43n.tif` outputs for inference — point the batch inference script at these files, not the originals.
+
+**KUTRU village — skip entirely:**
+
+The TIF is corrupted and the ECW fallback cannot be read on Colab. Exclude it from all file globs:
+
+```python
+import glob
+
+all_orthos = sorted(glob.glob(
+    '/content/drive/MyDrive/mopr-hackathon/raw/training/**/*.tif',
+    recursive=True
+))
+SKIP = ['kutru_aaklanka_451189']
+orthos = [f for f in all_orthos if not any(s in f for s in SKIP)]
+print(f"Using {len(orthos)} training orthos")  # expect 9
+```
+
+#### CRS strategy for training
+
+You do **not** need all villages in a single CRS for the model to train correctly — SegFormer operates on pixel arrays and does not use geographic coordinates. CRS only matters when merging tiles back into a full-scene COG and when exporting to GPKG. The practical approach is:
+
+- Process each village's tiles independently (each village stays in its own UTM zone)
+- During tile merging (Day 4), `rasterio.merge` handles per-village merging within the same CRS automatically
+- Only report per-village outputs; do not attempt a cross-zone mosaic
 
 ### 3. Run the tiling script
 
@@ -60,8 +173,6 @@ Switch to a GPU runtime now. Mount Drive, then tile all villages:
 ```python
 !pip install rasterio rio-cogeo tqdm --quiet
 
-import sys
-sys.path.insert(0, '/content/drive/MyDrive/mopr-hackathon/scripts')
 from tile_geotiff import tile_geotiff
 
 import glob
