@@ -153,9 +153,9 @@ all_orthos = sorted(glob.glob(
     '/content/drive/MyDrive/mopr-hackathon/raw/training/**/*.tif',
     recursive=True
 ))
-SKIP = ['kutru_aaklanka_451189']
+SKIP = ['KUTRU_451189_AAKLANKA_451163_ORTHO']
 orthos = [f for f in all_orthos if not any(s in f for s in SKIP)]
-print(f"Using {len(orthos)} training orthos")  # expect 9
+print(f"Using {len(orthos)} training orthos")
 ```
 
 #### CRS strategy for training
