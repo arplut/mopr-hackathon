@@ -129,13 +129,15 @@ def tile_geotiff(
                         continue
 
                     # Compute geotransform for this tile window
-                    out_transform = window_transform(window, transform)
 
                     output_profile = {
                         **profile,
                         "height": tile_size,
                         "width": tile_size,
-                        "transform": out_transform,
+                        "transform": window_transform(window, src.transform),
+                        "tiled": True,
+                        "blockxsize": 512,
+                        "blockysize": 512,
                         "crs": crs,
                     }
 
@@ -234,3 +236,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
